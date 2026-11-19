@@ -31,6 +31,7 @@
 		"index.ts",
 		"goal.ts",
 		"goal-state.ts",
+		"goal-prompt.ts",
 		"locales/",
 		"todo.ts",
 		"todo-overlay.ts",

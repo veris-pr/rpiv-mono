@@ -18,7 +18,15 @@ export interface Goal {
 	question?: string;
 	answer?: string;
 	finding?: string;
+	updates?: GoalUpdate[];
 	evidence: Record<string, { check: string; result: string }>;
+}
+export interface GoalUpdate {
+	kind: "progress" | "finding" | "failure";
+	item?: number;
+	message: string;
+	approach?: string;
+	next?: string;
 }
 export interface DraftItem {
 	subject: string;
@@ -56,6 +64,25 @@ export class GoalChange {
 		public state: TaskState,
 		public goal: Goal,
 	) {}
+	record(update: GoalUpdate): boolean {
+		if (!update.message.trim()) throw Error("A concrete result or observation is required.");
+		const entry = { ...update, item: update.item ?? this.goal.current };
+		const history: GoalUpdate[] =
+			this.goal.updates ?? (this.goal.finding ? [{ kind: "finding", message: this.goal.finding }] : []);
+		if (
+			history.some(
+				(previous) =>
+					previous.kind === entry.kind &&
+					previous.item === entry.item &&
+					previous.message === entry.message &&
+					previous.approach === entry.approach &&
+					previous.next === entry.next,
+			)
+		)
+			return false;
+		this.goal.updates = [...history, entry];
+		return true;
+	}
 	private write(action: TaskAction, params: TaskMutationParams) {
 		const r = applyTaskMutation(this.state, action, params);
 		if (r.op.kind === "error") throw Error(r.op.message);
@@ -124,7 +151,7 @@ export class GoalChange {
 			g.status = "completed";
 			return;
 		}
-		this.write("update", { id: next.id, status: "in_progress" });
+		if (next.status !== "in_progress") this.write("update", { id: next.id, status: "in_progress" });
 		g.status = "running";
 	}
 	release() {
@@ -149,6 +176,7 @@ export class GoalChange {
 		if (t.blockedBy?.some((id) => this.state.tasks.find((row) => row.id === id)?.status !== "completed"))
 			throw Error("Prerequisites are unfinished.");
 		g.evidence[id] = { check, result };
+		this.record({ kind: "progress", item: id, message: `Verified ${check}: ${result}` });
 		this.write("update", { id, status: "completed" });
 		g.current = undefined;
 		this.advance();

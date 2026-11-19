@@ -1,15 +1,24 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { buildGoalInstructions } from "./goal-prompt.ts";
 import { active, currentTask, type Goal, GoalChange, identity, parseScope, pause } from "./goal-state.ts";
 import { getState, sid } from "./state/store.ts";
 import { persistTodo } from "./todo.ts";
+import { sanitizeTerminalText } from "./tool/sanitize.ts";
 import type { TaskMutationParams } from "./tool/types.ts";
 
 const prefix = "[rpiv-goal turn ";
+const turnType = "rpiv-goal-turn";
+const refinementType = "rpiv-goal-refinement";
+interface TurnDetails {
+	token: string;
+	instructions: string;
+}
 const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: {} });
 const parameters = Type.Object({
-	action: Type.String({ description: "plan, ask, block, finding, or complete" }),
+	action: Type.String({ description: "plan, ask, block, progress, finding, failure, or complete" }),
 	items: Type.Optional(
 		Type.Array(
 			Type.Object({
@@ -24,10 +33,14 @@ const parameters = Type.Object({
 	check: Type.Optional(Type.String()),
 	result: Type.Optional(Type.String()),
 	message: Type.Optional(Type.String()),
+	approach: Type.Optional(Type.String({ description: "The approach attempted. Required for failure." })),
+	next: Type.Optional(Type.String({ description: "A revised next step. Required for failure." })),
 });
 interface Session {
 	goal?: Goal;
 	token?: string;
+	turnToken?: string;
+	lastInstructions?: string;
 	timer?: ReturnType<typeof setTimeout>;
 	work: boolean;
 	authorized: boolean;
@@ -35,6 +48,10 @@ interface Session {
 }
 export function registerGoals(pi: ExtensionAPI, refresh: (ctx: ExtensionContext) => Promise<void>) {
 	const sessions = new Map<string, Session>();
+	pi.registerMessageRenderer(
+		turnType,
+		(message, _options, theme) => new Text(theme.fg("accent", sanitizeTerminalText(String(message.content))), 0, 0),
+	);
 	function live(ctx: ExtensionContext) {
 		const id = sid(ctx);
 		let s = sessions.get(id);
@@ -48,6 +65,8 @@ export function registerGoals(pi: ExtensionAPI, refresh: (ctx: ExtensionContext)
 		clearTimeout(s.timer);
 		s.timer = undefined;
 		s.token = undefined;
+		s.turnToken = undefined;
+		s.lastInstructions = undefined;
 		s.authorized = false;
 		s.work = false;
 		s.closed = true;
@@ -95,6 +114,11 @@ export function registerGoals(pi: ExtensionAPI, refresh: (ctx: ExtensionContext)
 		pause(c.goal, reason);
 		save(ctx, c);
 	}
+	function appendRefinement(s: Session, instructions: string) {
+		if (s.lastInstructions === instructions) return;
+		pi.sendMessage({ customType: refinementType, content: instructions, display: false }, { deliverAs: "steer" });
+		s.lastInstructions = instructions;
+	}
 	function schedule(ctx: ExtensionContext) {
 		const s = live(ctx);
 		if (s.token || !active(s.goal) || s.goal.status === "paused") return;
@@ -107,7 +131,33 @@ export function registerGoals(pi: ExtensionAPI, refresh: (ctx: ExtensionContext)
 					s.timer = setTimeout(dispatch, 50);
 					return;
 				}
-				pi.sendUserMessage(`${prefix + token}]`, { deliverAs: "followUp" });
+				const c = change(ctx);
+				if (c.goal.phase === "running") c.advance();
+				if (c.state !== getState(sid(ctx)) || JSON.stringify(c.goal) !== JSON.stringify(s.goal)) save(ctx, c);
+				const goal = c.goal;
+				if (!active(goal) || goal.status === "paused") return;
+				const task = currentTask(getState(sid(ctx)), goal);
+				const label = task ? `Working on todo #${task.id} — ${task.subject}` : `Planning — ${goal.scope}`;
+				s.token = undefined;
+				s.turnToken = token;
+				// Pi 0.80.2 starts idle custom messages without before_agent_start.
+				s.authorized = true;
+				s.closed = false;
+				s.work = false;
+				const instructions = buildGoalInstructions(c.state, goal);
+				appendRefinement(s, instructions);
+				pi.sendMessage<TurnDetails>(
+					{
+						customType: turnType,
+						content: sanitizeTerminalText(label),
+						display: true,
+						details: {
+							token,
+							instructions,
+						},
+					},
+					{ triggerTurn: true, deliverAs: "followUp" },
+				);
 			} catch (error) {
 				stop(s);
 				if (!/stale after session replacement/.test(String(error)))
@@ -228,33 +278,46 @@ export function registerGoals(pi: ExtensionAPI, refresh: (ctx: ExtensionContext)
 		s.authorized = false;
 		s.work = false;
 		s.closed = false;
-		if ("prompt" in e && e.prompt.startsWith(prefix)) {
-			if (!s.token || e.prompt !== `${prefix + s.token}]` || !active(g) || g.status === "paused") {
+		if ("message" in e && e.message.customType === turnType) {
+			const details = e.message.details as TurnDetails | undefined;
+			if (!s.turnToken || details?.token !== s.turnToken || !active(g) || g.status === "paused") {
 				s.closed = true;
 				ctx.abort();
-				return { systemPrompt: `${e.systemPrompt}\nStale goal dispatch. Stop immediately.` };
+				return;
 			}
-			s.token = undefined;
 			s.authorized = true;
-			const task = currentTask(getState(sid(ctx)), g);
-			return {
-				systemPrompt:
-					e.systemPrompt +
-					"\nGoal: " +
-					JSON.stringify({
-						phase: g.phase,
-						objective: g.scope,
-						current: task,
-						answer: g.answer,
-						finding: g.finding,
-					}) +
-					"\nUse goal_step for this run. In planning, investigate and clarify material decisions with ask, then submit plan items with done criteria and 1-based earlier prerequisite indexes. In running, work only on the current item. Verify its done criteria then complete with its id, check and observed result. Use ask for user decisions, block for obstacles, finding for concrete research results. Never claim success based on a promise.",
-			};
+			return;
+		}
+		s.turnToken = undefined;
+		if ("prompt" in e && e.prompt.startsWith(prefix)) {
+			s.closed = true;
+			ctx.abort();
+			return;
 		}
 		if (g?.status === "paused")
 			return {
-				systemPrompt: `${e.systemPrompt}\nThe goal is paused. Discuss only until the user runs /goal-resume.`,
+				message: {
+					customType: refinementType,
+					content: "The goal is paused. Discuss only until the user runs /goal-resume.",
+					display: false,
+				},
 			};
+	});
+	pi.on("turn_end", (event, ctx) => {
+		const s = live(ctx);
+		if (
+			!s.authorized ||
+			s.closed ||
+			!active(s.goal) ||
+			s.goal.status === "paused" ||
+			!event.toolResults.length ||
+			event.message.role !== "assistant" ||
+			event.message.stopReason === "error" ||
+			event.message.stopReason === "aborted"
+		)
+			return;
+		// Pi consumes steering after turn_end, following the whole tool-result batch.
+		appendRefinement(s, buildGoalInstructions(getState(sid(ctx)), s.goal));
 	});
 	pi.on("tool_call", (e, ctx) => {
 		const s = live(ctx);
@@ -268,7 +331,30 @@ export function registerGoals(pi: ExtensionAPI, refresh: (ctx: ExtensionContext)
 	});
 	pi.on("tool_result", (e, ctx) => {
 		const s = live(ctx);
-		if (s.authorized && !e.isError && !["goal_step", "todo"].includes(e.toolName)) s.work = true;
+		if (
+			!s.authorized ||
+			s.closed ||
+			!active(s.goal) ||
+			s.goal.status === "paused" ||
+			["goal_step", "todo"].includes(e.toolName)
+		)
+			return;
+		const c = change(ctx);
+		const observed = e.content
+			.filter((part) => part.type === "text")
+			.map((part) => part.text)
+			.join("\n")
+			.slice(0, 2000);
+		if (
+			c.record({
+				kind: e.isError ? "failure" : "progress",
+				approach: `${e.toolName} ${JSON.stringify(e.input).slice(0, 500)}`,
+				message: observed || `${e.toolName} returned ${e.isError ? "an error" : "success"} without text output.`,
+			})
+		) {
+			save(ctx, c);
+			s.work = true;
+		}
 	});
 	pi.on("agent_end", (e, ctx) => {
 		const s = live(ctx);
@@ -290,7 +376,7 @@ export function registerGoals(pi: ExtensionAPI, refresh: (ctx: ExtensionContext)
 		name: "goal_step",
 		label: "Goal progress",
 		description:
-			"Drive an active /goal. Submit a plan, ask a question, report a blocker or finding, or verify the current item.",
+			"Drive an active /goal. Submit a plan, ask a question, record progress, findings or failed approaches, report a blocker, or verify the current item.",
 		parameters,
 		async execute(_id, p, _signal, _update, ctx) {
 			try {
@@ -302,15 +388,18 @@ export function registerGoals(pi: ExtensionAPI, refresh: (ctx: ExtensionContext)
 				if (p.action === "complete") c.complete(p.id ?? 0, p.check ?? "", p.result ?? "");
 				else if (p.action === "plan") c.plan(p.items ?? []);
 				else {
-					const msg = p.message?.trim();
+					const msg = (p.action === "failure" ? p.result : p.message)?.trim();
 					if (!msg) throw Error("A message is required.");
 					if (p.action === "ask" || p.action === "block") {
 						pause(g, msg);
 						g.question = p.action === "ask" ? msg : undefined;
 						g.answer = undefined;
-					} else if (p.action === "finding") {
-						if (g.finding === msg) throw Error("Finding already recorded.");
-						g.finding = msg;
+					} else if (p.action === "finding" || p.action === "progress" || p.action === "failure") {
+						if (p.action === "failure" && (!p.approach?.trim() || !p.next?.trim()))
+							throw Error("Report the failed approach, observed result and revised next step.");
+						if (!c.record({ kind: p.action, message: msg, approach: p.approach?.trim(), next: p.next?.trim() }))
+							throw Error("Observation already recorded. Report new evidence or a revised approach.");
+						if (p.action === "finding") g.finding = msg;
 					} else throw Error("Unknown goal action.");
 				}
 				save(ctx, c);

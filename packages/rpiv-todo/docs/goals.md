@@ -49,6 +49,28 @@ The existing todo reducer owns row creation, status transitions and prerequisite
 
 Pi registers the commands and the agent-facing `goal_step` tool through the package's existing extension entry point. Each dispatched turn receives the objective, phase, current row, latest answer and finding. An item closes when the agent supplies its ID, the check it performed and the observed result. The evidence is the agent's report. The extension checks identity, prerequisites and required fields. [Pi packages](https://docs.pi.dev/latest/packages)
 
+Continuation appears as `Working on todo #3 — <subject>` or `Planning — <objective>`. Dispatch identifiers live in extension-message metadata. Execution instructions are appended as hidden extension messages while the transcript displays the label. This uses the custom-message API available in Pi 0.80.2.
+
+Completion is evaluated when the agent submits `goal_step` with `action: "complete"`. It must identify the current item and supply both the check performed and its observed result. After checking row identity, current status and prerequisites, the plugin saves that evidence, completes the todo and selects the next ready item. The goal completes when the whole selection is finished. Ending a turn alone does not complete an item. The agent-end hook checks interruption and observed progress to decide whether to continue or pause. Verification quality depends on the working agent's checks and evidence.
+
+Before every goal dispatch, the runner reconciles the original selection against the shared todo store. It validates stable row identities and prerequisites, advances past completed rows, and updates the current item. A deleted or replaced row pauses the run. Unresolved prerequisites pause when no selected item is ready. A fully completed selection ends the goal without starting another model turn. Newly added rows join a future goal when selected. Reload and tree navigation rebuild the shared store from the branch history.
+
+Each continuation prompt is refined from the reconciled list and a persisted observation history. A hidden snapshot is appended before dispatch. During a run, the `turn_end` hook appends changed guidance after the entire tool-result batch, using Pi's steering queue so the next model response sees it. Identical guidance is skipped. Earlier messages and system instructions retain their original content, including through pause, resume, completion and restart. Compaction and explicit branch navigation establish a new history boundary.
+
+Refinements include all recorded findings and failed approaches, the latest eight progress observations, completed-item evidence, remaining rows, the current item's criteria and the latest relevant proposed next step. A failure adds instructions to diagnose its cause and revise the approach before retrying. Findings direct the agent to revisit contradicted assumptions. Progress directs it to build on the work already observed and check what remains against the completion criteria. This refinement compiles the recorded evidence into context and priorities for the working model. The working model decides and reports the revised approach.
+
+The append-only model history preserves matching request prefixes for provider caching. The smoke test captures the actual scripted-provider inputs and checks that each successive message list extends the previous one, with the same system prompt. It ignores runtime timestamps that Pi recreates when replaying custom messages and compares the remaining fields exactly. It also checks that a tool failure receives an appended recovery refinement within the same goal run. This verifies request structure. Cache-hit rates and token savings depend on the provider and its cache settings.
+
+The `goal_step` tool accepts these updates during an authorized goal turn. Each successful update checkpoints the history and ends the turn so the next continuation receives the refinement.
+
+| Action | Required fields | Effect |
+| --- | --- | --- |
+| `progress` | `message` | Record concrete progress. Optional `next` proposes the next step. |
+| `finding` | `message` | Retain a discovery alongside previous findings. Optional `next` proposes a response. |
+| `failure` | `approach`, `result`, `next` | Record what failed, the observed result and a revised next step. |
+
+Tool results also add progress or failure observations. Automatic entries include an input excerpt of up to 500 characters and text output of up to 2,000 characters. Successful tool output is an observation for the model to assess. The `complete` action still requires its own verification evidence. Duplicate observations add no progress, allowing the existing no-progress check to pause a repeated unsuccessful run. Version-1 snapshots with a single legacy finding continue to load and retain that finding when the new history is first written.
+
 Two design ideas carry over from the reference projects. Persistent execution gives Pi a reason to continue after a turn ends. Returning a concrete question to the user lets the agent incorporate feedback at the point of uncertainty. Both behaviors run inside the fork using Pi's session and messaging APIs. [pi-goal-x](https://github.com/tmonk/pi-goal-x) · [Plannotator](https://github.com/backnotprop/plannotator)
 
 ## Implementation goals and review checkpoints

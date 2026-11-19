@@ -121,6 +121,7 @@ export function createMockPi(options: CreateMockPiOptions = {}): MockPi {
 			captured.entries.push({ customType, data });
 		}),
 		sendMessage: vi.fn(async () => {}),
+		registerMessageRenderer: vi.fn(),
 		sendUserMessage: vi.fn((_content: unknown, _options?: unknown) => {
 			// Sync fire-and-forget in production; mock captures nothing extra.
 			// Tests assert on sentMessages via the chain or directly on this spy.
