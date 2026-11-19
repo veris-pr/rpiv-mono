@@ -29,6 +29,8 @@
 	"files": [
 		"config.ts",
 		"index.ts",
+		"goal.ts",
+		"goal-state.ts",
 		"locales/",
 		"todo.ts",
 		"todo-overlay.ts",

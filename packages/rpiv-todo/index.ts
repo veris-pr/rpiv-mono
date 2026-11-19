@@ -19,9 +19,10 @@
  * correctly after upgrade.
  */
 
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { COLLAPSE_KEY_OFF, resolveCollapseKey } from "./config.ts";
+import { registerGoals } from "./goal.ts";
 import { I18N_NAMESPACE } from "./state/i18n-bridge.ts";
 import { replayFromBranch } from "./state/replay.ts";
 import {
@@ -147,7 +148,6 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 		todoOverlay.update();
 	}
 
-	registerTodoTool(pi);
 	registerTodosCommand(pi);
 
 	// Collapse/expand hotkey for the todo overlay. The key is resolved once at
@@ -177,13 +177,12 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 	// the replacement session's session_start replays it. Other errors are real replay
 	// bugs and must propagate. The render is sid-gated so a child never refreshes the
 	// foreground overlay.
-	const replayAndRefresh = async (
-		ctx: Parameters<typeof sid>[0] & Parameters<typeof replayFromBranch>[0],
-	): Promise<void> => {
+	const replayAndRefresh = async (ctx: ExtensionContext, restoreGoal = false): Promise<void> => {
 		let isForeground = false;
 		try {
 			const id = sid(ctx);
 			replaceState(id, replayFromBranch(ctx));
+			if (restoreGoal) goals.restore(ctx);
 			isForeground = id === getActiveRenderSession();
 		} catch (e) {
 			if (!isStaleCtxError(e)) throw e;
@@ -197,6 +196,7 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 			id = sid(ctx);
 			// Every session replays into its OWN data slot (Phase 1 isolation).
 			replaceState(id, replayFromBranch(ctx));
+			goals.restore(ctx);
 		} catch (e) {
 			// Parity with compact/tree/shutdown: session_start is the fresh-ctx event
 			// so the stale risk is low, but a stale/throwing ctx has nothing to bind —
@@ -221,7 +221,7 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
-		await replayAndRefresh(ctx);
+		await replayAndRefresh(ctx, true);
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -237,6 +237,7 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 		}
 		// The shutting-down session's own data slot is always evicted.
 		evictSession(s);
+		goals.shutdown(s);
 		// Overlay teardown is sid-gated: a child shutdown (distinct sid) must not
 		// dispose the foreground's overlay. Only the foreground's own shutdown
 		// (or an unknown/stale sid) tears it down and clears the pointer.
@@ -296,4 +297,8 @@ export default function (pi: ExtensionAPI, importOverlay: TodoOverlayImporter = 
 		if (id !== getActiveRenderSession()) return;
 		todoOverlay?.hideCompletedTasksFromPreviousTurn();
 	});
+	const goals = registerGoals(pi, async (ctx) => {
+		if (sid(ctx) === getActiveRenderSession()) await updateTodoOverlay();
+	});
+	registerTodoTool(pi, goals.guard, goals.changed);
 }

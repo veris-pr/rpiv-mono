@@ -16,6 +16,8 @@ agent is doing now, what it finished, and what is queued. The list is rebuilt
 from the conversation itself, so it survives `/reload` and compaction — useful
 on long research → design → implement sessions.
 
+This fork also runs selected todos as a persistent goal. Use `/goal` for all unfinished items, `/goal complete todo items #2-#5` for a range, or `/goal <objective>` to build a plan. [Commands, recovery behavior and implementation checkpoints](docs/goals.md)
+
 ## Install
 
 ```sh

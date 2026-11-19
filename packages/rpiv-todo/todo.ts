@@ -12,7 +12,7 @@
  * continue to import from `./todo.js`.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { loadConfig, validateGuidanceFields } from "./config.ts";
 import { formatStatusLabel, t } from "./state/i18n-bridge.ts";
 import { selectTasksByStatus, selectTodoCounts, selectVisibleTasks } from "./state/selectors.ts";
@@ -67,7 +67,21 @@ export const DEFAULT_PROMPT_GUIDELINES: string[] = [
 	"Subject must be short and imperative (e.g. 'Research existing tool'); description is for long-form detail. activeForm is a present-continuous label shown while in_progress.",
 ];
 
-export function registerTodoTool(pi: ExtensionAPI): void {
+export function persistTodo(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	state: ReturnType<typeof getState>,
+	snapshot: object,
+) {
+	pi.appendEntry(STATE_ENTRY_TYPE, snapshot);
+	commitState(sid(ctx), state);
+}
+
+export function registerTodoTool(
+	pi: ExtensionAPI,
+	guard?: (ctx: ExtensionContext, params: TaskMutationParams) => string | undefined,
+	changed?: (ctx: ExtensionContext) => void,
+): void {
 	const guidance = validateGuidanceFields(loadConfig().guidance);
 	pi.registerTool({
 		name: TOOL_NAME,
@@ -81,14 +95,15 @@ export function registerTodoTool(pi: ExtensionAPI): void {
 		prepareArguments: prepareTodoArguments,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const result = applyTaskMutation(getState(sid(ctx)), params.action, params as TaskMutationParams);
-			commitState(sid(ctx), result.state);
-			const toolResult = buildToolResult(params.action, params as TaskMutationParams, result.state, result.op);
-			// Persist the snapshot as a custom entry on the calling session's branch, however the
-			// tool was reached: a call made through another tool (`ctx.executeTool`, e.g. codemode)
-			// never lands as a standalone `toolResult`, so its `details` alone would not survive
-			// replay. Pi's own codemode persists its `store()` the same way.
-			if (changesState(result.op)) pi.appendEntry(STATE_ENTRY_TYPE, toolResult.details);
+			const state = getState(sid(ctx));
+			const denied = guard?.(ctx, params);
+			if (denied) return buildToolResult(params.action, params, state, { kind: "error", message: denied });
+			const result = applyTaskMutation(state, params.action, params);
+			const toolResult = buildToolResult(params.action, params, result.state, result.op);
+			if (changesState(result.op)) {
+				persistTodo(pi, ctx, result.state, toolResult.details);
+				changed?.(ctx);
+			}
 			return toolResult;
 		},
 
